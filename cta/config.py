@@ -1,8 +1,18 @@
 """写死的规则。这一版不做参数搜索。"""
+import os
 from pathlib import Path
 
-# 只读。不在这里下载，也不把结果写回这份缓存。
-CACHE_DIR = Path("/Users/yanyunfeng/文稿/tradingview/cache")
+_REPO = Path(__file__).resolve().parents[1]
+_LOCAL_TV = Path("/Users/yanyunfeng/文稿/tradingview/cache")
+_env = os.environ.get("CTA_CACHE_DIR")
+if _env:
+    CACHE_DIR = Path(_env)
+elif _LOCAL_TV.is_dir():
+    # 本地：只读 tradingview 已缓存的日线与 fixed_presets.json
+    CACHE_DIR = _LOCAL_TV
+else:
+    # Streamlit Cloud 等：用本项目 cache/（日线由 yfinance 写入）
+    CACHE_DIR = _REPO / "cache"
 PERIOD_CANDIDATES = ("2y", "5y", "10y", "max")
 
 TICKERS = [

@@ -1,6 +1,7 @@
 """各品种的背离账。KBE 用十年回测固定参数，其余读 Dashboard 已保存的参数。"""
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -26,11 +27,26 @@ KBE_PRESET = {
 
 
 def _tradingview():
-    root = str(CACHE_DIR.parent)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    import tradingview_realization_v2 as tv
-    return tv
+    """本地开发可读 tradingview 项目；Streamlit Cloud 等环境用仓库内副本。"""
+    roots = []
+    tv_cache_parent = CACHE_DIR.parent
+    if tv_cache_parent.is_dir():
+        roots.append(tv_cache_parent)
+    repo_root = Path(__file__).resolve().parents[1]
+    roots.append(repo_root)
+    for root in roots:
+        s = str(root)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+        try:
+            import tradingview_realization_v2 as tv
+            return tv
+        except ImportError:
+            continue
+    raise ImportError(
+        "找不到 tradingview_realization_v2（背离信号）。"
+        "请确认仓库根目录有 tradingview_realization_v2.py。"
+    )
 
 
 def _mode(spec):

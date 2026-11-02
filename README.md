@@ -41,7 +41,7 @@ cd "/Users/yanyunfeng/文稿/cta"
 python run.py
 ```
 
-依赖见 `requirements.txt`（pandas、numpy、matplotlib）。
+依赖见 `requirements.txt`（含 streamlit、yfinance、altair、scipy 等）。部署到 Streamlit Cloud 时无需本机 tradingview 路径；可选环境变量 `CTA_CACHE_DIR` 指定只读缓存目录。
 
 ## 输出
 
