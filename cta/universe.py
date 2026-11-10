@@ -1,6 +1,6 @@
 """组合里有哪些标的。默认名单减掉隐藏的，再加上手动加的。
 
-隐藏和新增分别记在 cta/cache/hidden_tickers.txt、extra_tickers.txt。
+隐藏和新增分别记在 cta/cache/hidden_tickers.txt、extra_tickers.txt。行情不放这里。
 只改名单，不删行情缓存。
 """
 from pathlib import Path

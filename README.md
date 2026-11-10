@@ -2,7 +2,7 @@
 
 动量（momo）与均值回归（背离切换）组合回测，以及 Streamlit 持仓看板。
 
-独立于 `tradingview` 背离项目。默认只读 `tradingview/cache` 里已经缓存的日线；看板「更新至最新」会把增量写到本项目的 `cache/`，不写回 tradingview。
+信号代码和日线缓存与 `tradingview` 看板共用一份：`tradingview/tradingview_realization_v2.py` 和 `tradingview/cache`。看板「更新至最新」也写回那份日线。本项目 `cache/` 只保留自己的标的名单（隐藏、手动添加），不再存行情。
 
 ## Streamlit 看板
 

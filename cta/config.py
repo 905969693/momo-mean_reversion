@@ -3,15 +3,29 @@ import os
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
-_LOCAL_TV = Path("/Users/yanyunfeng/文稿/tradingview/cache")
+
+def _tv_root():
+    """本地用 tradingview 项目；远程电脑上同一份代码在 /workspace/tradingview-like。"""
+    env = os.environ.get("CTA_TV_ROOT")
+    if env:
+        return Path(env)
+    mac = Path("/Users/yanyunfeng/文稿/tradingview")
+    if (mac / "tradingview_realization_v2.py").is_file():
+        return mac
+    box = Path("/workspace/tradingview-like")
+    if (box / "tradingview_realization_v2.py").is_file():
+        return box
+    return mac
+
+TV_ROOT = _tv_root()
+_LOCAL_TV = TV_ROOT / "cache"
 _env = os.environ.get("CTA_CACHE_DIR")
 if _env:
     CACHE_DIR = Path(_env)
 elif _LOCAL_TV.is_dir():
-    # 本地：只读 tradingview 已缓存的日线与 fixed_presets.json
+    # 日线和 fixed_presets.json 与 tradingview 看板共用这一份。
     CACHE_DIR = _LOCAL_TV
 else:
-    # Streamlit Cloud 等：用本项目 cache/（日线由 yfinance 写入）
     CACHE_DIR = _REPO / "cache"
 PERIOD_CANDIDATES = ("2y", "5y", "10y", "max")
 

@@ -27,26 +27,24 @@ KBE_PRESET = {
 
 
 def _tradingview():
-    """本地开发可读 tradingview 项目；Streamlit Cloud 等环境用仓库内副本。"""
-    roots = []
-    tv_cache_parent = CACHE_DIR.parent
-    if tv_cache_parent.is_dir():
-        roots.append(tv_cache_parent)
-    repo_root = Path(__file__).resolve().parents[1]
-    roots.append(repo_root)
-    for root in roots:
-        s = str(root)
-        if s not in sys.path:
-            sys.path.insert(0, s)
-        try:
-            import tradingview_realization_v2 as tv
-            return tv
-        except ImportError:
-            continue
-    raise ImportError(
-        "找不到 tradingview_realization_v2（背离信号）。"
-        "请确认仓库根目录有 tradingview_realization_v2.py。"
-    )
+    """信号函数只加载 tradingview 项目里的那一份，避免仓库里的旧拷贝抢先被导入。"""
+    import importlib.util
+
+    from cta.config import TV_ROOT
+
+    path = TV_ROOT / "tradingview_realization_v2.py"
+    if not path.is_file():
+        raise ImportError(f"找不到信号代码 {path}")
+    loaded = sys.modules.get("tradingview_realization_v2")
+    if loaded is not None and Path(getattr(loaded, "__file__", "")).resolve() == path.resolve():
+        return loaded
+    spec = importlib.util.spec_from_file_location("tradingview_realization_v2", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载信号代码 {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["tradingview_realization_v2"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _mode(spec):

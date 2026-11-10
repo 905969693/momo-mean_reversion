@@ -1,14 +1,13 @@
 """G10 与即期新兴市场外汇，不含 USDTRY。纯动量、切换、买入持有，三本账都不加杠杆。
 
 没有保存参数的品种用项目默认值：滤波关、pivot 3、共振 3、去重 10、只做多。
-已有缓存的品种只读 tradingview/cache，缺的日线写到 cta/cache，不回写原缓存。
+日线只读、只写 tradingview/cache，和背离看板同一份。
 """
 import sys
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -22,12 +21,11 @@ from cta.backtest import (  # noqa: E402
     plot_equity,
 )
 from cta.config import CACHE_DIR, COST_BPS, PERIOD_CANDIDATES  # noqa: E402
-from cta.data import load_market, read_ohlcv, safe_chart_name  # noqa: E402
-from cta.divergence_book import HOLD_DAYS, load_presets, switch_position  # noqa: E402
+from cta.data import load_market, safe_chart_name  # noqa: E402
+from cta.divergence_book import HOLD_DAYS, _tradingview, load_presets, switch_position  # noqa: E402
 from cta.forecast import tsmom_forecast  # noqa: E402
 from cta.position import long_only_forecast  # noqa: E402
 
-LOCAL_CACHE = ROOT / "cache"
 SAVED = ("USDJPY=X", "USDCHF=X", "USDMXN=X")
 NAMES = [
     "EURUSD=X",
@@ -64,28 +62,6 @@ def default_preset(ticker):
         "hold": HOLD_DAYS,
         "summary": "滤波关、pivot 3、共振 3、去重 10、只做多",
     }
-
-
-def _flatten_download(frame):
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-    keep = [col for col in ("Open", "High", "Low", "Close", "Volume") if col in frame.columns]
-    out = frame.loc[:, keep].copy()
-    if "Volume" not in out.columns:
-        out["Volume"] = 0.0
-    out.index = pd.to_datetime(out.index)
-    out.index.name = "Date"
-    out = out.dropna(subset=["Open", "High", "Low", "Close"])
-    out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out
-
-
-def _local_path(ticker):
-    return LOCAL_CACHE / f"{safe_chart_name(ticker)}_10y.csv"
-
-
-def _adjust_path(ticker):
-    return LOCAL_CACHE / f"{safe_chart_name(ticker)}_adjust.txt"
 
 
 def _csv_span(path):
@@ -125,13 +101,8 @@ def _tradingview_end(ticker):
 
 
 def series_as_of(ticker):
-    """这份组合实际会用的最后一根。cta 缓存更晚时用它，否则用原缓存。"""
-    local = _csv_span(_local_path(ticker))
-    local_end = None if local is None else local[1]
-    tradingview_end = _tradingview_end(ticker)
-    if local_end and (tradingview_end is None or local_end >= tradingview_end):
-        return local_end
-    return tradingview_end
+    """这份组合实际会用的最后一根，也就是共享日线缓存里会被选中的那份。"""
+    return _tradingview_end(ticker)
 
 
 def portfolio_as_of(tickers):
@@ -156,117 +127,42 @@ def portfolio_as_of(tickers):
     }
 
 
-def _read_adjust(ticker, default):
-    path = _adjust_path(ticker)
-    if not path.is_file():
-        return default
-    return path.read_text().strip() == "true"
-
-
-def _write_adjust(ticker, adjust):
-    LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
-    _adjust_path(ticker).write_text("true\n" if adjust else "false\n")
-
-
-def _prefer_local(local_df, tradingview_df):
-    if local_df is None or local_df.empty:
-        return False
-    if tradingview_df is None or tradingview_df.empty:
-        return True
-    local_end = pd.Timestamp(local_df.index[-1]).normalize()
-    tradingview_end = pd.Timestamp(tradingview_df.index[-1]).normalize()
-    if local_end > tradingview_end:
-        return True
-    if local_end < tradingview_end:
-        return False
-    return len(local_df) >= len(tradingview_df)
-
-
-def _daily_meta(ticker, daily, source, path):
-    return {
-        "标的": ticker,
-        "区间": "10y",
-        "缓存文件": str(path),
-        "来源": source,
-        "日线起始": daily.index[0].date().isoformat(),
-        "日线结束": daily.index[-1].date().isoformat(),
-        "日线根数": len(daily),
-    }
+def _periods_to_refresh(ticker):
+    name = safe_chart_name(ticker)
+    periods = [
+        period for period in PERIOD_CANDIDATES
+        if (CACHE_DIR / f"{name}_{period}.csv").is_file()
+    ]
+    return periods or ["10y"]
 
 
 def ensure_daily(ticker):
-    tradingview_df = None
-    tradingview_meta = None
+    """读共享日线。还没有缓存时，按 10 年下载进同一份缓存。"""
     try:
-        tradingview_df, _weekly, tradingview_meta = load_market(ticker)
+        daily, _weekly, meta = load_market(ticker)
     except FileNotFoundError:
-        tradingview_df = None
-    path = _local_path(ticker)
-    local_df = read_ohlcv(path) if path.is_file() else None
-    if _prefer_local(local_df, tradingview_df):
-        return local_df, _daily_meta(ticker, local_df, "cta/cache", path)
-    if tradingview_df is not None:
-        tradingview_meta["来源"] = "tradingview/cache"
-        return tradingview_df, tradingview_meta
-    LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
-    downloaded = yf.download(ticker, period="10y", auto_adjust=False, progress=False)
-    flat = _flatten_download(downloaded)
-    if flat.empty:
-        raise RuntimeError(f"{ticker} 没有下载到日线")
-    flat.to_csv(path)
-    _write_adjust(ticker, False)
-    return flat, _daily_meta(ticker, flat, "cta/cache", path)
+        refresh_daily(ticker)
+        daily, _weekly, meta = load_market(ticker)
+    meta["来源"] = str(CACHE_DIR)
+    return daily, meta
 
 
 def refresh_daily(ticker):
-    """只补最后一根之后的交易日，写到 cta/cache。不改 tradingview/cache。
-
-    原缓存的价格是复权的，沿用复权。只存在于 cta/cache 的价格不复权，沿用不复权。
-    """
-    tradingview_df = None
-    try:
-        tradingview_df, _weekly, _meta = load_market(ticker)
-    except FileNotFoundError:
-        tradingview_df = None
-    path = _local_path(ticker)
-    local_df = read_ohlcv(path) if path.is_file() else None
-    if _prefer_local(local_df, tradingview_df):
-        base = local_df
-        adjust = _read_adjust(ticker, default=False)
-    elif tradingview_df is not None:
-        base = tradingview_df
-        adjust = True
-    else:
-        base = None
-        adjust = False
-    if base is None:
-        downloaded = yf.download(ticker, period="10y", auto_adjust=adjust, progress=False)
-        flat = _flatten_download(downloaded)
-        if flat.empty:
-            raise RuntimeError(f"{ticker} 没有下载到日线")
-        LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
-        flat.to_csv(path)
-        _write_adjust(ticker, adjust)
-        return pd.Timestamp(flat.index[-1]).date().isoformat()
-    last = pd.Timestamp(base.index[-1]).normalize()
-    today = pd.Timestamp.today().normalize()
-    updated = base
-    if last + pd.Timedelta(days=1) <= today:
-        new_raw = yf.download(
-            ticker,
-            start=(last + pd.Timedelta(days=1)).date().isoformat(),
-            auto_adjust=adjust,
-            progress=False,
+    """增量补齐共享缓存里已有的区间。没有文件时下载 10 年。"""
+    tv = _tradingview()
+    if Path(tv.CACHE_DIR).resolve() != Path(CACHE_DIR).resolve():
+        raise RuntimeError(
+            f"信号模块的缓存是 {tv.CACHE_DIR}，CTA 读的是 {CACHE_DIR}，没有写同一份日线。"
         )
-        new = _flatten_download(new_raw) if new_raw is not None and not new_raw.empty else pd.DataFrame()
-        if not new.empty:
-            updated = pd.concat([base, new])
-            updated = updated[~updated.index.duplicated(keep="last")].sort_index()
-    if updated is not base:
-        LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
-        updated.to_csv(path)
-        _write_adjust(ticker, adjust)
-    return pd.Timestamp(updated.index[-1]).date().isoformat()
+    last = None
+    for period in _periods_to_refresh(ticker):
+        df = tv.load_ohlcv(ticker, period=period)
+        stamp = pd.Timestamp(df.index[-1]).date().isoformat()
+        if last is None or stamp > last:
+            last = stamp
+    if last is None:
+        raise RuntimeError(f"{ticker} 没有下载到日线")
+    return last
 
 
 def refresh_listed(tickers, parent):
