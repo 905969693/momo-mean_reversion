@@ -22,7 +22,7 @@ from cta.backtest import (  # noqa: E402
     plot_equity,
 )
 from cta.config import COST_BPS  # noqa: E402
-from cta.divergence_book import switch_position  # noqa: E402
+from cta.divergence_book import peak_holds, switch_position  # noqa: E402
 from cta.forecast import tsmom_forecast  # noqa: E402
 from cta.mix_book import GROUPS, presets_for  # noqa: E402
 from cta.position import long_only_forecast  # noqa: E402
@@ -38,7 +38,21 @@ def run():
     for ticker in names:
         daily, meta = ensure_daily(ticker)
         markets[ticker] = daily
-        print(f"{groups[ticker]}  {ticker}  {meta['日线起始']} → {meta['日线结束']}  {presets[ticker]['summary']}")
+        if groups[ticker] == "外汇":
+            hold_text = "不做背离"
+            presets[ticker]["底尖峰"] = ""
+            presets[ticker]["顶尖峰"] = ""
+        else:
+            bull_hold, bear_hold = peak_holds(daily, presets[ticker])
+            presets[ticker]["底尖峰"] = bull_hold
+            presets[ticker]["顶尖峰"] = bear_hold if groups[ticker] == "商品" else ""
+            hold_text = f"底 {bull_hold} 根"
+            if groups[ticker] == "商品":
+                hold_text += f" / 顶 {bear_hold} 根"
+        print(
+            f"{groups[ticker]}  {ticker}  {meta['日线起始']} → {meta['日线结束']}"
+            f"  {presets[ticker]['summary']}  {hold_text}"
+        )
 
     rows = []
     chart = []
@@ -83,7 +97,13 @@ def run():
     summary = pd.DataFrame(rows)
     summary.to_csv(out_dir / "summary.csv", index=False)
     pd.DataFrame(
-        [{"分组": groups[ticker], "标的": ticker, "规则": preset["summary"]} for ticker, preset in presets.items()]
+        [{
+            "分组": groups[ticker],
+            "标的": ticker,
+            "规则": preset["summary"],
+            "底尖峰": preset.get("底尖峰", ""),
+            "顶尖峰": preset.get("顶尖峰", ""),
+        } for ticker, preset in presets.items()]
     ).to_csv(out_dir / "presets.csv", index=False)
     plot_equity(out_dir / "equity_mix.png", "外汇只做动量，无杠杆", chart)
     shown = format_summary(summary)

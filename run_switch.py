@@ -1,4 +1,4 @@
-"""每个品种平时用动量；背离确认后该品种全仓改做背离，持有 10 天再回到动量。仓位不超过 1。"""
+"""每个品种平时用动量；背离确认后该品种全仓改做背离，持有该侧尖峰根数再回到动量。仓位不超过 1。"""
 import sys
 from datetime import date
 from pathlib import Path

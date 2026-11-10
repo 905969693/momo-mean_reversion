@@ -48,6 +48,7 @@ VP_BINS = 40                               # 新增：剖面分档数
 BB_PERIOD = 20
 BB_STD = 2.0
 STATS_HORIZONS = (5, 10, 20)               # 新增：信号后验持有期（交易日）
+POSTERIOR_SPAN = tuple(range(3, 41))       # 持有期曲线：3 到 40 根
 USE_TREND_FILTER = True                    # 新增：批处理信号是否先过顺势滤波
 TREND_MA_N = 200                           # 新增：顺势滤波均线周期（日线 200 / 周线 40）
 # Dashboard @st.cache_data 用此版本号失效旧缓存（改 apply_trend_filter 时递增）
@@ -833,6 +834,140 @@ def combine_edge_scores(long_score, long_n, short_score, short_n, long_only=Fals
         return np.nan
     weight = sum(n for _, n in parts)
     return sum(score * n for score, n in parts) / weight
+
+
+def unconditional_horizon_baselines(closes, horizons, short=False):
+    """每个持有期的无条件胜率和平均收益，口径与 unconditional_returns 相同。"""
+    closes = np.asarray(closes, dtype=float)
+    wins, means = {}, {}
+    n_bars = len(closes)
+    for horizon in horizons:
+        horizon = int(horizon)
+        last = n_bars - horizon
+        if last <= 0:
+            wins[horizon] = np.nan
+            means[horizon] = np.nan
+            continue
+        entry = closes[:last]
+        exit_px = closes[horizon : horizon + last]
+        ok = np.isfinite(entry) & np.isfinite(exit_px) & (entry != 0)
+        if not ok.any():
+            wins[horizon] = np.nan
+            means[horizon] = np.nan
+            continue
+        rets = exit_px[ok] / entry[ok] - 1.0
+        if short:
+            rets = -rets
+        wins[horizon] = float((rets > 0).mean())
+        means[horizon] = float(rets.mean())
+    return wins, means
+
+
+def _signal_entry_positions(df, sig, entry_shift):
+    if sig is None or len(sig) == 0:
+        return np.array([], dtype=int)
+    pos = df.index.get_indexer(sig.index)
+    keep = pos >= 0
+    return pos[keep] + int(entry_shift)
+
+
+def _signal_horizon_returns(closes, entry_idx, horizon, short):
+    """与 signal_returns 的同周期路径一致：能持满的信号都计入，不过滤价格。"""
+    closes = np.asarray(closes, dtype=float)
+    entry_idx = np.asarray(entry_idx, dtype=int)
+    horizon = int(horizon)
+    if entry_idx.size == 0:
+        return np.array([], dtype=float)
+    exit_i = entry_idx + horizon
+    valid = (entry_idx >= 0) & (exit_i < len(closes))
+    if not valid.any():
+        return np.array([], dtype=float)
+    rets = closes[exit_i[valid]] / closes[entry_idx[valid]] - 1.0
+    if short:
+        rets = -rets
+    return np.asarray(rets, dtype=float)
+
+
+def _curve_row(horizon, rets, base_win, base_mean):
+    rets = np.asarray(rets, dtype=float)
+    n = int(np.isfinite(rets).sum()) if rets.size else 0
+    win = float((rets > 0).mean()) if rets.size else np.nan
+    mean_sig = float(np.mean(rets)) if rets.size and np.isfinite(rets).all() else (
+        float(np.nanmean(rets)) if n else np.nan
+    )
+    excess = (
+        mean_sig - base_mean
+        if np.isfinite(mean_sig) and np.isfinite(base_mean)
+        else np.nan
+    )
+    return {
+        "持有根数": int(horizon),
+        "信号数": n,
+        "胜率": win,
+        "无条件胜率": float(base_win) if np.isfinite(base_win) else np.nan,
+        "分数": edge_score(win, base_win, n),
+        "超额平均": excess,
+    }
+
+
+def hold_edge_curve(
+    df,
+    sig,
+    horizons=POSTERIOR_SPAN,
+    entry_shift=PIVOT_ORDER,
+    short=False,
+    daily_df=None,
+    horizon_count_daily=False,
+    baselines=None,
+):
+    """每个持有期一行：收缩超额胜率，以及信号平均减去无条件平均。"""
+    horizons = tuple(int(h) for h in horizons)
+    rows = []
+    if horizon_count_daily and daily_df is not None and len(daily_df):
+        for horizon in horizons:
+            rets = signal_returns(
+                df, sig, horizon, entry_shift=entry_shift, short=short,
+                daily_df=daily_df, horizon_count_daily=True,
+            )
+            base = unconditional_returns(
+                df, horizon, short=short, daily_df=daily_df, horizon_count_daily=True,
+            )
+            base_win = float((base > 0).mean()) if base.size else np.nan
+            base_mean = float(base.mean()) if base.size else np.nan
+            rows.append(_curve_row(horizon, rets, base_win, base_mean))
+        return pd.DataFrame(rows)
+
+    closes = df.Close.to_numpy(dtype=float)
+    if baselines is None:
+        baselines = unconditional_horizon_baselines(closes, horizons, short=short)
+    base_win, base_mean = baselines
+    entries = _signal_entry_positions(df, sig, entry_shift)
+    for horizon in horizons:
+        rets = _signal_horizon_returns(closes, entries, horizon, short)
+        rows.append(_curve_row(
+            horizon, rets, base_win.get(horizon, np.nan), base_mean.get(horizon, np.nan),
+        ))
+    return pd.DataFrame(rows)
+
+
+def peak_hold(horizons, values):
+    """超额平均最高的持有根数。并列时取更短的那根。"""
+    best_h = None
+    best_v = None
+    for horizon, value in zip(horizons, values):
+        if value is None or not np.isfinite(value):
+            continue
+        value = float(value)
+        if best_v is None or value > best_v:
+            best_h = int(horizon)
+            best_v = value
+    return best_h
+
+
+def curve_peak_hold(curve):
+    if curve is None or curve.empty:
+        return None
+    return peak_hold(curve["持有根数"].tolist(), curve["超额平均"].tolist())
 
 
 def fib_levels(df, lookback=LOOKBACK):

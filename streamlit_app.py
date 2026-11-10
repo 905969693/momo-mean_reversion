@@ -17,7 +17,7 @@ from run_fx import portfolio_as_of, refresh_listed
 
 WINDOW = 30
 # build_book 返回字段有变时加 1，避免 st.cache_data 继续用旧结果。
-BOOK_CACHE_VERSION = 3
+BOOK_CACHE_VERSION = 4
 
 PNL_SPANS = {
     "1 个月": 21,

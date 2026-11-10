@@ -7,3 +7,5 @@ cache/*.csv
 .streamlit/secrets.toml
 .env
 .env.*
+
+.tools/
