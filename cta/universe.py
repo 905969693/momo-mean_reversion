@@ -82,10 +82,24 @@ def listed_members(hidden=None, extras=None):
     return members
 
 
-def add_member(name, group):
+def group_for(name):
+    """已知品种用原来的分组。外汇代码归外汇，其余新标的归股票。"""
+    ticker = canonical_ticker(name)
+    for group, tickers in GROUPS.items():
+        if ticker in tickers:
+            return group
+    upper = ticker.upper()
+    if upper.endswith("=X") or upper.endswith("_X"):
+        return "外汇"
+    return "股票"
+
+
+def add_member(name, group=None):
     ticker = canonical_ticker(name)
     if not ticker:
         return []
+    if group is None:
+        group = group_for(ticker)
     if group not in GROUP_ORDER:
         raise ValueError(f"分组必须是股票、商品或外汇，收到 {group}")
     hidden = load_hidden()

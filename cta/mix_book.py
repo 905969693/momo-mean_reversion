@@ -1,4 +1,4 @@
-"""当前组合的仓位。股票只做底背离，商品顶底都做，外汇只做动量。
+"""当前组合的仓位。每个标的用自己的主方法覆盖动量，没有主方法时保持动量。
 
 每个品种一份等权资金，品种仓位在 [-1, 1]。组合权重是这份仓位除以当天有信号的品种数，
 所以总敞口不超过 100%，没有杠杆。
@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 from cta.config import CACHE_DIR  # noqa: E402
 from cta.backtest import combine_equal_risk, daily_pnl  # noqa: E402
 from cta.config import ANNUALIZATION  # noqa: E402
-from cta.divergence_book import HOLD_DAYS, KBE_PRESET, _mode, divergence_side, switch_position  # noqa: E402
+from cta.divergence_book import HOLD_DAYS, KBE_PRESET, _mode, primary_switch_position  # noqa: E402
 from cta.forecast import tsmom_forecast  # noqa: E402
 from run_fx import NAMES as FX_NAMES, default_preset, ensure_daily  # noqa: E402
 
@@ -27,7 +27,6 @@ GROUPS = {
     "外汇": [ticker for ticker in FX_NAMES if ticker.startswith("USD")],
 }
 GROUP_ORDER = {"股票": 0, "商品": 1, "外汇": 2}
-SHORT_OK = {"商品"}
 
 
 def default_members():
@@ -78,39 +77,20 @@ def presets_for(members=None):
         preset = _saved_preset(ticker) or default_preset(ticker)
         preset = dict(preset)
         preset["ticker"] = ticker
-        if group == "外汇":
-            preset["summary"] = "只做动量，不做背离"
-        else:
-            preset["long_only"] = group not in SHORT_OK
-            text = preset["summary"].replace("、只做多", "").replace("、多空都做", "")
-            preset["summary"] = text + ("、多空都做" if group in SHORT_OK else "、只做底背离")
         presets[ticker] = preset
         groups[ticker] = group
     return presets, groups
 
 
-def _source_frame(weight, side):
-    source = pd.Series(pd.NA, index=weight.index, dtype="object")
-    live = weight.notna()
-    source = source.mask(live, "动量")
-    source = source.mask(live & (side > 0), "底背离")
-    source = source.mask(live & (side < 0), "顶背离")
-    return source
-
-
 def compute_sleeves(markets, presets, groups):
+    del groups
     weights = {}
     sources = {}
     closes = {}
     for ticker, daily in markets.items():
         forecast = tsmom_forecast(daily.Close).clip(-1, 1)
-        if groups[ticker] == "外汇":
-            weight = forecast
-            source = pd.Series("动量", index=daily.index, dtype="object").where(weight.notna())
-        else:
-            weight = switch_position(daily, presets[ticker], forecast)
-            side, _events = divergence_side(daily, presets[ticker], both_sides=False)
-            source = _source_frame(weight, side.reindex(weight.index).fillna(0.0))
+        weight, source, method = primary_switch_position(daily, presets[ticker], forecast)
+        presets[ticker]["主方法"] = method
         weights[ticker] = weight
         sources[ticker] = source
         closes[ticker] = daily.Close
@@ -209,6 +189,7 @@ def snapshot_table(weight_frame, source_frame, close_frame, presets, groups, day
             "品种仓位": float(weight),
             "组合权重": float(book_weight),
             "来源": source,
+            "主方法": presets[ticker].get("主方法", ""),
             "规则": presets[ticker]["summary"],
             "收盘": float(close) if pd.notna(close) else np.nan,
             "行情日": pd.Timestamp(weight_day).date(),
@@ -298,6 +279,45 @@ def pnl_returns_table(weight_frame, markets, cost_bps=0.0):
     })
 
 
+ROLLING_SHARPE_DAYS = 126  # 约 6 个月交易日，和区间里的「6 个月」同一根数。
+
+
+def _rolling_sharpe(returns, window):
+    """和 backtest.sharpe 同一公式：窗口均值 / 标准差 × √252。不足一整窗的位置留空。"""
+    mean = returns.rolling(window, min_periods=window).mean()
+    scale = returns.rolling(window, min_periods=window).std()
+    out = mean / scale * np.sqrt(ANNUALIZATION)
+    return out.where(scale > 0)
+
+
+def _spy_book_returns(index):
+    """SPY 在组合交易日上的日收益。和净值图用的是同一条收盘序列。"""
+    try:
+        daily, _meta = ensure_daily("SPY")
+    except Exception:
+        return pd.Series(np.nan, index=index, dtype=float)
+    close = daily.Close.reindex(index)
+    return close.pct_change()
+
+
+def rolling_sharpe_history(returns_table, trading_days=None, window=ROLLING_SHARPE_DAYS):
+    """所选区间上的 6 个月滚动夏普。回看用到区间开始之前的交易日。"""
+    empty = pd.DataFrame(columns=["日期", "系列", "夏普"])
+    if returns_table is None or returns_table.empty:
+        return empty
+    dates = pd.DatetimeIndex(returns_table["日期"])
+    port = pd.Series(returns_table["日盈亏"].to_numpy(dtype=float), index=dates)
+    frame = pd.DataFrame({
+        "日期": dates,
+        "组合": _rolling_sharpe(port, window).to_numpy(),
+        "SPY": _rolling_sharpe(_spy_book_returns(dates), window).to_numpy(),
+    })
+    if trading_days is not None:
+        frame = frame.tail(int(trading_days))
+    long = frame.melt(id_vars="日期", var_name="系列", value_name="夏普")
+    return long.dropna(subset=["夏普"]).reset_index(drop=True)
+
+
 def slice_pnl_history(returns_table, trading_days=None):
     """截取最近 trading_days 根（None 表示全部），组合与 SPY 都在区间起点归一化为 1。"""
     if returns_table is None or returns_table.empty:
@@ -354,7 +374,9 @@ def _empty_book(failed, names):
 
 def build_book(members=None, sessions=30):
     if members is None:
-        members = default_members()
+        from cta.universe import listed_members
+
+        members = listed_members()
     members = list(dict.fromkeys((ticker, group) for ticker, group in members))
     presets, groups = presets_for(members)
     markets = {}

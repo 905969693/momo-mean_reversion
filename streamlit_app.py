@@ -11,13 +11,13 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cta.mix_book import GROUP_ORDER, build_book, slice_pnl_history
-from cta.universe import add_member, listed_members, remove_member
+from cta.mix_book import ROLLING_SHARPE_DAYS, build_book, rolling_sharpe_history, slice_pnl_history
+from cta.universe import add_member, group_for, listed_members, remove_member
 from run_fx import portfolio_as_of, refresh_listed
 
 WINDOW = 30
 # build_book 返回字段有变时加 1，避免 st.cache_data 继续用旧结果。
-BOOK_CACHE_VERSION = 4
+BOOK_CACHE_VERSION = 5
 
 PNL_SPANS = {
     "1 个月": 21,
@@ -35,15 +35,12 @@ def load_book(members, data_rev, book_cache_version):
     return build_book(members, sessions=WINDOW)
 
 
-def _subset(frame, group, held_only):
+def _subset(frame, held_only):
     if frame is None or frame.empty:
         return frame
-    view = frame
-    if group != "全部":
-        view = view[view["分组"] == group]
-    if held_only and "方向" in view.columns:
-        view = view[view["方向"] != "空仓"]
-    return view
+    if held_only and "方向" in frame.columns:
+        return frame[frame["方向"] != "空仓"]
+    return frame
 
 
 def _metrics(snapshot, changes):
@@ -62,7 +59,7 @@ def _metrics(snapshot, changes):
         st.metric(
             "净敞口",
             f"{net:.1%}",
-            help="多头组合权重减去空头组合权重。筛选分组时，只加总该分组。",
+            help="多头组合权重减去空头组合权重。",
             border=True,
         )
         st.metric("多头敞口", f"{long:.1%}", border=True)
@@ -106,6 +103,39 @@ def _pnl_compare_chart(frame):
     st.altair_chart(chart, alt="过去一年组合净值与 SPY 买入持有对比")
 
 
+def _rolling_sharpe_chart(frame):
+    if frame is None or frame.empty:
+        st.caption(f"6 个月滚动夏普还没形成。需要连续 {ROLLING_SHARPE_DAYS} 个交易日。")
+        return
+    lo = float(frame["夏普"].min())
+    hi = float(frame["夏普"].max())
+    pad = max((hi - lo) * 0.08, 0.05)
+    y_scale = alt.Scale(domain=[lo - pad, hi + pad], zero=False, nice=False)
+    chart = (
+        alt.Chart(frame)
+        .mark_line()
+        .encode(
+            x=alt.X("日期:T", title="日期"),
+            y=alt.Y("夏普:Q", title="夏普", scale=y_scale, axis=alt.Axis(format=".1f")),
+            color=alt.Color(
+                "系列:N",
+                title="系列",
+                scale=alt.Scale(
+                    domain=["组合", "SPY"],
+                    range=["#34D399", "#60A5FA"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("日期:T", title="日期"),
+                alt.Tooltip("系列:N", title="系列"),
+                alt.Tooltip("夏普:Q", title="夏普", format=".2f"),
+            ],
+        )
+        .properties(height=240)
+    )
+    st.altair_chart(chart, alt="组合与 SPY 的 6 个月滚动夏普")
+
+
 def _holdings_chart(snapshot):
     order = list(snapshot["标的"])
     chart = (
@@ -129,11 +159,27 @@ def _holdings_chart(snapshot):
                 alt.Tooltip("组合权重:Q", title="组合权重", format=".2%"),
                 alt.Tooltip("品种仓位:Q", title="品种仓位", format=".0%"),
                 alt.Tooltip("来源:N", title="来源"),
+                alt.Tooltip("主方法:N", title="主方法"),
             ],
         )
         .properties(height=max(280, 28 * len(snapshot)))
     )
     st.altair_chart(chart, alt="各品种占组合的权重，多头在右侧，空头在左侧")
+
+
+def _text_px(value):
+    """按表格字体估一列文字的像素，汉字比英文宽。"""
+    text = "" if value is None else str(value)
+    return sum(15 if ord(char) > 127 else 9 for char in text)
+
+
+def _column_width(values, header, *, minimum=72, padding=36):
+    widest = _text_px(header)
+    for value in values:
+        if pd.isna(value):
+            continue
+        widest = max(widest, _text_px(value))
+    return max(minimum, widest + padding)
 
 
 def _weight_columns():
@@ -157,6 +203,79 @@ def _weight_columns():
     }
 
 
+def _holdings_columns(snapshot):
+    """短列按内容收紧，主方法按整句留宽，避免被自动列宽上限截断。"""
+    config = _weight_columns()
+    config["标的"] = st.column_config.TextColumn(
+        "标的",
+        pinned=True,
+        width=_column_width(snapshot["标的"], "标的", minimum=104),
+    )
+    config["分组"] = st.column_config.TextColumn(
+        "分组",
+        width=_column_width(snapshot["分组"], "分组", minimum=80),
+    )
+    config["方向"] = st.column_config.TextColumn(
+        "方向",
+        width=_column_width(snapshot["方向"], "方向", minimum=80),
+    )
+    config["品种仓位"] = st.column_config.NumberColumn(
+        "品种仓位",
+        format="percent",
+        width=_column_width(["-100.00%"], "品种仓位", minimum=108),
+        help="这一份品种资金的方向。1 是多满，-1 是空满。",
+    )
+    config["组合权重"] = st.column_config.NumberColumn(
+        "组合权重",
+        format="percent",
+        width=_column_width(["-100.00%"], "组合权重", minimum=108),
+        help="占整个账户的比例。品种之间等权，没有杠杆。",
+    )
+    config["来源"] = st.column_config.TextColumn(
+        "来源",
+        width=_column_width(snapshot["来源"], "来源", minimum=88),
+    )
+    config["主方法"] = st.column_config.TextColumn(
+        "主方法",
+        width=_column_width(snapshot["主方法"], "主方法", minimum=420, padding=48),
+    )
+    if "规则" in snapshot.columns:
+        config["规则"] = st.column_config.TextColumn(
+            "规则",
+            width=_column_width(snapshot["规则"], "规则", padding=40),
+        )
+    if "收盘" in snapshot.columns:
+        shown = [
+            "" if pd.isna(value) else f"{float(value):.4f}" for value in snapshot["收盘"]
+        ]
+        config["收盘"] = st.column_config.NumberColumn(
+            "收盘",
+            format="%.4f",
+            width=_column_width(shown, "收盘", minimum=96),
+        )
+    if "行情日" in snapshot.columns:
+        config["行情日"] = st.column_config.TextColumn(
+            "行情日",
+            width=_column_width(snapshot["行情日"].astype(str), "行情日", minimum=112),
+        )
+    return config
+
+
+def _commit_add():
+    """按钮回调在整页重跑之前执行，这样这次重跑读到的就是新名单。"""
+    name = str(st.session_state.get("new_ticker_input") or "").strip()
+    if not name:
+        return
+    add_member(name, group_for(name))
+    load_book.clear()
+    st.session_state.new_ticker_input = ""
+
+
+def _commit_remove(ticker):
+    remove_member(ticker)
+    load_book.clear()
+
+
 def _render_ticker_menu():
     members = listed_members()
     with st.popover(
@@ -164,39 +283,35 @@ def _render_ticker_menu():
         width="stretch",
         help="添加或删除组合里的标的。删除只从这张持仓拿掉，不删行情缓存。",
     ):
-        st.caption("股票只做底背离，商品顶底都做，外汇只做动量。新加的标的按这里选的分组走。")
-        new_name = st.text_input(
+        st.caption("每个标的用自己的主方法覆盖动量。没有主方法的方向保持动量。")
+        st.text_input(
             "添加标的",
             placeholder="SPY、GLD、USDJPY=X",
             key="new_ticker_input",
         )
-        new_group = st.segmented_control(
-            "分组",
-            list(GROUP_ORDER),
-            default="股票",
-            key="new_ticker_group",
-        )
-        if st.button("添加", key="add_ticker_btn", width="stretch"):
-            name = new_name.strip()
-            if name:
-                add_member(name, new_group or "股票")
-                load_book.clear()
-                st.rerun()
+        st.button("添加", key="add_ticker_btn", width="stretch", on_click=_commit_add)
         if not members:
             st.caption("列表是空的。")
         for ticker, group in members:
             label, remove = st.columns([4, 1], vertical_alignment="center")
             label.markdown(f"**{ticker}** · {group}")
-            if remove.button("删除", key=f"del_ticker_{ticker}", help=f"从组合移除 {ticker}"):
-                remove_member(ticker)
-                load_book.clear()
-                st.rerun()
+            remove.button(
+                "删除",
+                key=f"del_ticker_{ticker}",
+                help=f"从组合移除 {ticker}",
+                on_click=_commit_remove,
+                args=(ticker,),
+            )
     return members
 
 
 st.set_page_config(page_title="组合持仓", layout="wide")
 st.title("组合持仓")
-st.caption("每个品种一份等权资金，仓位在 -1 到 1，不加杠杆。收盘上的仓位从下一交易日开始计收益。")
+st.caption(
+    "每个品种一份等权资金，仓位在 -1 到 1，不加杠杆。"
+    "主方法是背离或九转里下界中位数大于 0 的一侧，持有该信号自己的尖峰根数。"
+    "收盘上的仓位从下一交易日开始计收益。"
+)
 
 if "data_rev" not in st.session_state:
     st.session_state.data_rev = 0
@@ -207,13 +322,6 @@ with st.sidebar:
     members = _render_ticker_menu()
     st.caption("调仓只记录品种仓位的变化。每天的等权再平衡不单列。")
     st.divider()
-    st.header("筛选")
-    group = st.segmented_control(
-        "分组",
-        ["全部", "股票", "商品", "外汇"],
-        default="全部",
-        key="view_group",
-    )
     held_only = st.toggle("只看有仓位", value=False)
     if st.button("重新计算", icon=":material/refresh:", width="stretch"):
         load_book.clear()
@@ -265,13 +373,12 @@ if not members:
     st.warning("列表是空的，请先在左侧添加一个标的。", title="没有标的")
     st.stop()
 
-group = group or "全部"
 book = load_book(tuple(members), st.session_state.data_rev, BOOK_CACHE_VERSION)
 if book["failed"]:
     st.warning("；".join(book["failed"]), title="部分标的没有行情")
 
-snapshot = _subset(book["snapshot"], group, held_only)
-changes = _subset(book["changes"], group, held_only=False)
+snapshot = _subset(book["snapshot"], held_only)
+changes = _subset(book["changes"], held_only=False)
 if book["book_date"]:
     quote_note = ""
     if book["latest_quote"] and book["latest_quote"] != book["book_date"]:
@@ -308,30 +415,38 @@ with st.container(border=True):
         st.caption(
             f"{span_label}：{start} 至 {end}，{len(pnl_view)} 个交易日。"
             f"组合累计 {port_total:.1%}。{spy_note}"
-            "切换策略、品种等权、0 bps；SPY 为买入持有，所选区间起点都归一化为 1。"
+            "动量加上各标的主方法、品种等权、0 bps；SPY 为买入持有，所选区间起点都归一化为 1。"
         )
         _pnl_compare_chart(pnl_view)
+        st.caption(
+            f"6 个月滚动夏普，回看 {ROLLING_SHARPE_DAYS} 个交易日。"
+            "窗口内日收益的均值除以标准差，再乘以 √252，不含无风险利率。"
+            "曲线跟着上面的区间走，回看用到区间开始之前的交易日。"
+        )
+        _rolling_sharpe_chart(
+            rolling_sharpe_history(pnl_returns, trading_days=PNL_SPANS[span_label])
+        )
 
-left, right = st.columns([3, 2])
-with left:
-    with st.container(border=True):
-        st.subheader("当前持仓")
-        if snapshot is None or snapshot.empty:
-            st.info("这个筛选下没有持仓。", title="没有记录")
-        else:
-            st.dataframe(
-                snapshot,
-                column_config=_weight_columns(),
-                hide_index=True,
-                alt="当前每个品种的方向、组合权重和信号来源",
-            )
-with right:
-    with st.container(border=True):
-        st.subheader("组合权重")
-        if snapshot is None or snapshot.empty:
-            st.info("这个筛选下没有可以画的权重。", title="没有记录")
-        else:
-            _holdings_chart(snapshot)
+with st.container(border=True):
+    st.subheader("当前持仓")
+    if snapshot is None or snapshot.empty:
+        st.info("这个筛选下没有持仓。", title="没有记录")
+    else:
+        st.dataframe(
+            snapshot,
+            column_config=_holdings_columns(snapshot),
+            hide_index=True,
+            width="stretch",
+            height="content",
+            alt="当前每个品种的方向、组合权重和信号来源",
+        )
+
+with st.container(border=True):
+    st.subheader("组合权重")
+    if snapshot is None or snapshot.empty:
+        st.info("这个筛选下没有可以画的权重。", title="没有记录")
+    else:
+        _holdings_chart(snapshot)
 
 with st.container(border=True):
     st.subheader("过去 30 个交易日的调仓")
@@ -352,8 +467,6 @@ with st.container(border=True):
 
 with st.container(border=True):
     st.subheader("净敞口")
-    if group != "全部":
-        st.caption("净敞口是整个组合的，不随分组筛选改变。")
     exposure = book["exposure"]
     if exposure is None or exposure.empty:
         st.info("还没有足够的行情来画净敞口。", title="没有记录")

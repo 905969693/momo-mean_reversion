@@ -1,1 +1,6 @@
 KBE	股票
+USDJPY=X	股票
+AUDUSD=X	股票
+LQD	股票
+IAT	股票
+EWY	股票

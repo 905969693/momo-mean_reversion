@@ -1,8 +1,8 @@
 """股票、商品、美元报价外汇放在一个等权组合。不加杠杆。
 
-股票的背离只做底。商品的底背离、顶背离都做。外汇只做动量，不做背离。
-纯动量账 forecast ≤ 0 时空仓。切换账里股票和商品的动量可以做空，外汇也用这套动量。
-没有保存参数的品种用滤波关、pivot 3、共振 3、去重 10。
+切换账在动量上覆盖每个标的自己的主方法。没有主方法的方向保持动量。
+纯动量账 forecast ≤ 0 时空仓。切换账的动量可以做空。
+没有保存参数的品种用滤波关、pivot 3、共振 3、去重 10、只做多。
 """
 import sys
 from datetime import date
@@ -22,9 +22,10 @@ from cta.backtest import (  # noqa: E402
     plot_equity,
 )
 from cta.config import COST_BPS  # noqa: E402
-from cta.divergence_book import peak_holds, switch_position  # noqa: E402
+from cta.divergence_book import primary_switch_position  # noqa: E402
 from cta.forecast import tsmom_forecast  # noqa: E402
-from cta.mix_book import GROUPS, presets_for  # noqa: E402
+from cta.mix_book import presets_for  # noqa: E402
+from cta.universe import listed_members  # noqa: E402
 from cta.position import long_only_forecast  # noqa: E402
 from run_fx import HOLD, MOMENTUM, SWITCH, ensure_daily  # noqa: E402
 
@@ -32,26 +33,21 @@ from run_fx import HOLD, MOMENTUM, SWITCH, ensure_daily  # noqa: E402
 def run():
     out_dir = ROOT / "output" / date.today().isoformat() / "mix_book_fx_momentum"
     out_dir.mkdir(parents=True, exist_ok=True)
-    presets, groups = presets_for()
+    presets, groups = presets_for(listed_members())
     names = list(presets)
     markets = {}
+    switched_weights = {}
     for ticker in names:
         daily, meta = ensure_daily(ticker)
         markets[ticker] = daily
-        if groups[ticker] == "外汇":
-            hold_text = "不做背离"
-            presets[ticker]["底尖峰"] = ""
-            presets[ticker]["顶尖峰"] = ""
-        else:
-            bull_hold, bear_hold = peak_holds(daily, presets[ticker])
-            presets[ticker]["底尖峰"] = bull_hold
-            presets[ticker]["顶尖峰"] = bear_hold if groups[ticker] == "商品" else ""
-            hold_text = f"底 {bull_hold} 根"
-            if groups[ticker] == "商品":
-                hold_text += f" / 顶 {bear_hold} 根"
+        weight, _source, method = primary_switch_position(
+            daily, presets[ticker], tsmom_forecast(daily.Close).clip(-1, 1),
+        )
+        switched_weights[ticker] = weight
+        presets[ticker]["主方法"] = method
         print(
             f"{groups[ticker]}  {ticker}  {meta['日线起始']} → {meta['日线结束']}"
-            f"  {presets[ticker]['summary']}  {hold_text}"
+            f"  {presets[ticker]['summary']}  {method}"
         )
 
     rows = []
@@ -66,11 +62,7 @@ def run():
             held = momentum.dropna()
             if len(held) and ((held < -1e-12).any() or (held > 1).any()):
                 raise RuntimeError(f"{ticker} 纯动量仓位超出 [0, 1]")
-            momentum_both = forecast.clip(-1, 1)
-            if groups[ticker] == "外汇":
-                switched = momentum_both
-            else:
-                switched = switch_position(daily, presets[ticker], momentum_both)
+            switched = switched_weights[ticker]
             sleeve = switched.dropna()
             if len(sleeve) and float(sleeve.abs().max()) > 1 + 1e-9:
                 raise RuntimeError(f"{ticker} 切换仓位超过 1")
@@ -86,8 +78,13 @@ def run():
         rows.append(performance_row("组合", SWITCH, cost, switch_book))
         if cost == 0:
             rows.append(performance_row("组合", HOLD, cost, buyhold))
-            for group, tickers in GROUPS.items():
-                rows.append(performance_row(group, SWITCH, cost, combine_equal_risk({t: books[SWITCH][t] for t in tickers})))
+            by_group = {}
+            for ticker, group in groups.items():
+                by_group.setdefault(group, {})[ticker] = books[SWITCH][ticker]
+            for group in ("股票", "商品", "外汇"):
+                sleeves = by_group.get(group)
+                if sleeves:
+                    rows.append(performance_row(group, SWITCH, cost, combine_equal_risk(sleeves)))
             chart = [
                 (MOMENTUM, momentum_book, "-"),
                 (SWITCH, switch_book, "-"),
@@ -110,7 +107,10 @@ def run():
     print()
     print(shown[shown["标的"].isin(["组合", "股票", "商品", "外汇"])].to_string(index=False))
     print()
-    print(f"品种数 {len(names)}：股票 {len(GROUPS['股票'])}，商品 {len(GROUPS['商品'])}，外汇 {len(GROUPS['外汇'])}")
+    counts = {group: sum(item == group for item in groups.values()) for group in ("股票", "商品", "外汇")}
+    print(
+        f"品种数 {len(names)}：股票 {counts['股票']}，商品 {counts['商品']}，外汇 {counts['外汇']}"
+    )
     print(f"写出 {out_dir}")
     return out_dir
 

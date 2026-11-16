@@ -263,3 +263,69 @@ def switch_position(daily, preset, momentum):
     if len(finite) and float(finite.max()) > 1.0 + 1e-9:
         raise RuntimeError(f"{preset['ticker']} 仓位超过 1，需要杠杆")
     return out
+
+
+def _signal_events(index, signals, offset, sign, hold, label, n):
+    """信号所在 bar 再往后 offset 根，是这套统计的入场收盘。仓位从那根开始。"""
+    events = []
+    if signals is None or len(signals) == 0:
+        return events
+    for timestamp in signals.index:
+        entry = _bar_loc(index, timestamp) + int(offset)
+        if entry < n:
+            events.append((entry, float(sign), int(hold), label))
+    return events
+
+
+def primary_switch_position(daily, preset, momentum):
+    """没有主方法信号时用动量。主方法确认后改为该方向，持有该信号自己的尖峰根数。
+
+    每个方向只采用 evaluate_method_choice 选出的主方法：背离或九转。
+    下界中位数不过线的方向不覆盖动量。只做多时不做空。
+    共振不进仓位。背离入场在确认收盘，九转入场在第 9 根的下一根收盘。
+    """
+    tv = _tradingview()
+    rules = dict(preset)
+    bull, bear = filtered_signals(daily, rules)
+    order = int(rules["pivot_order"])
+    choice = tv.evaluate_method_choice(
+        daily, bull, bear, order, long_only=bool(rules["long_only"]),
+    )
+    down, up = tv.td_completed_nines(daily.Close)
+    n = len(daily)
+    events = []
+    for side_name, sign, div_sig, nine_sig, div_label, nine_label in (
+        ("long", 1.0, bull, down, "底背离", "下跌九转"),
+        ("short", -1.0, bear, up, "顶背离", "上涨九转"),
+    ):
+        side = choice[side_name]
+        if not side["adopted"]:
+            continue
+        if side["primary"] == "divergence":
+            hold = _peak_horizon(tv, daily, div_sig, order, short=(sign < 0))
+            events.extend(_signal_events(
+                daily.index, div_sig, order, sign, hold, div_label, n,
+            ))
+        elif side["primary"] == "nine":
+            hold = _peak_horizon(tv, daily, nine_sig, 1, short=(sign < 0))
+            events.extend(_signal_events(
+                daily.index, nine_sig, 1, sign, hold, nine_label, n,
+            ))
+    events.sort(key=lambda item: item[0])
+    position = momentum.reindex(daily.index).to_numpy(dtype=float).copy()
+    labels = np.empty(n, dtype=object)
+    labels[:] = None
+    for entry, sign, hold, label in events:
+        end = min(entry + hold, n)
+        position[entry:end] = sign
+        labels[entry:end] = label
+    weight = pd.Series(position, index=daily.index)
+    finite = weight.abs().dropna()
+    if len(finite) and float(finite.max()) > 1.0 + 1e-9:
+        raise RuntimeError(f"{preset['ticker']} 仓位超过 1，需要杠杆")
+    source = pd.Series(pd.NA, index=daily.index, dtype="object")
+    live = weight.notna()
+    source = source.mask(live, "动量")
+    named = pd.Series(labels, index=daily.index)
+    source = source.mask(live & named.notna(), named)
+    return weight, source, tv.method_choice_summary(choice)
